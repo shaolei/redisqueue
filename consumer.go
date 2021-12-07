@@ -1,12 +1,13 @@
 package redisqueue
 
 import (
+	"context"
 	"net"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v7"
+	"github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
 )
 
@@ -66,6 +67,7 @@ type ConsumerOptions struct {
 
 // Consumer adds a convenient wrapper around dequeuing and managing concurrency.
 type Consumer struct {
+	ctx context.Context
 	// Errors is a channel that you can receive from to centrally handle any
 	// errors that may occur either by your ConsumerFuncs or by internal
 	// processing functions. Because this is an unbuffered channel, you must
@@ -98,15 +100,15 @@ var defaultConsumerOptions = &ConsumerOptions{
 // to the hostname, GroupName to "redisqueue", VisibilityTimeout to 60 seconds,
 // BufferSize to 100, and Concurrency to 10. In most production environments,
 // you'll want to use NewConsumerWithOptions.
-func NewConsumer() (*Consumer, error) {
-	return NewConsumerWithOptions(defaultConsumerOptions)
+func NewConsumer(ctx context.Context) (*Consumer, error) {
+	return NewConsumerWithOptions(ctx,defaultConsumerOptions)
 }
 
 // NewConsumerWithOptions creates a Consumer with custom ConsumerOptions. If
 // Name is left empty, it defaults to the hostname; if GroupName is left empty,
 // it defaults to "redisqueue"; if BlockingTimeout is 0, it defaults to 5
 // seconds; if ReclaimInterval is 0, it defaults to 1 second.
-func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
+func NewConsumerWithOptions(ctx context.Context,options *ConsumerOptions) (*Consumer, error) {
 	hostname, _ := os.Hostname()
 
 	if options.Name == "" {
@@ -130,11 +132,12 @@ func NewConsumerWithOptions(options *ConsumerOptions) (*Consumer, error) {
 		r = newRedisClient(options.RedisOptions)
 	}
 
-	if err := redisPreflightChecks(r); err != nil {
+	if err := redisPreflightChecks(ctx, r); err != nil {
 		return nil, err
 	}
 
 	return &Consumer{
+		ctx: ctx,
 		Errors: make(chan error),
 
 		options:   options,
@@ -190,7 +193,7 @@ func (c *Consumer) Run() {
 
 	for stream, consumer := range c.consumers {
 		c.streams = append(c.streams, stream)
-		err := c.redis.XGroupCreateMkStream(stream, c.options.GroupName, consumer.id).Err()
+		err := c.redis.XGroupCreateMkStream(c.ctx,stream, c.options.GroupName, consumer.id).Err()
 		// ignoring the BUSYGROUP error makes this a noop
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 			c.Errors <- errors.Wrap(err, "error creating consumer group")
@@ -256,7 +259,7 @@ func (c *Consumer) reclaim() {
 				end := "+"
 
 				for {
-					res, err := c.redis.XPendingExt(&redis.XPendingExtArgs{
+					res, err := c.redis.XPendingExt(c.ctx, &redis.XPendingExtArgs{
 						Stream: stream,
 						Group:  c.options.GroupName,
 						Start:  start,
@@ -276,7 +279,7 @@ func (c *Consumer) reclaim() {
 
 					for _, r := range res {
 						if r.Idle >= c.options.VisibilityTimeout {
-							claimres, err := c.redis.XClaim(&redis.XClaimArgs{
+							claimres, err := c.redis.XClaim(c.ctx,&redis.XClaimArgs{
 								Stream:   stream,
 								Group:    c.options.GroupName,
 								Consumer: c.options.Name,
@@ -297,7 +300,7 @@ func (c *Consumer) reclaim() {
 							// exists, the only way we can get it out of the
 							// pending state is to acknowledge it.
 							if err == redis.Nil {
-								err = c.redis.XAck(stream, c.options.GroupName, r.ID).Err()
+								err = c.redis.XAck(c.ctx,stream, c.options.GroupName, r.ID).Err()
 								if err != nil {
 									c.Errors <- errors.Wrapf(err, "error acknowledging after failed claim for %q stream and %q message", stream, r.ID)
 									continue
@@ -335,7 +338,7 @@ func (c *Consumer) poll() {
 			}
 			return
 		default:
-			res, err := c.redis.XReadGroup(&redis.XReadGroupArgs{
+			res, err := c.redis.XReadGroup(c.ctx,&redis.XReadGroupArgs{
 				Group:    c.options.GroupName,
 				Consumer: c.options.Name,
 				Streams:  c.streams,
@@ -389,7 +392,7 @@ func (c *Consumer) work() {
 				c.Errors <- errors.Wrapf(err, "error calling ConsumerFunc for %q stream and %q message", msg.Stream, msg.ID)
 				continue
 			}
-			err = c.redis.XAck(msg.Stream, c.options.GroupName, msg.ID).Err()
+			err = c.redis.XAck(c.ctx,msg.Stream, c.options.GroupName, msg.ID).Err()
 			if err != nil {
 				c.Errors <- errors.Wrapf(err, "error acknowledging after success for %q stream and %q message", msg.Stream, msg.ID)
 				continue
